@@ -664,26 +664,28 @@
 
         Lampa.SettingsApi.addParam({
             component: 'uaflix',
-            param: { name: DOMAIN_KEY, type: 'input', default: DEFAULT_DOMAIN },
+            param: { name: DOMAIN_KEY, type: 'input', placeholder: DEFAULT_DOMAIN, values: '', default: DEFAULT_DOMAIN },
             field: { name: 'Домен сайту', description: 'На випадок якщо основний домен заблоковано/змінено' },
             onChange: function (value) { Lampa.Storage.set(DOMAIN_KEY, value); }
         });
 
         Lampa.SettingsApi.addParam({
             component: 'uaflix',
-            param: { name: PROXY_KEY, type: 'input', default: DEFAULT_PROXY },
+            param: { name: PROXY_KEY, type: 'input', placeholder: DEFAULT_PROXY, values: '', default: DEFAULT_PROXY },
             field: { name: 'CORS-проксі', description: 'Порожнє значення = звертатись напряму (без проксі)' },
             onChange: function (value) { Lampa.Storage.set(PROXY_KEY, value); }
         });
 
         Lampa.SettingsApi.addParam({
             component: 'uaflix',
-            param: { name: 'uaflix_clear_cache', type: 'button' },
+            param: { name: 'uaflix_clear_cache', type: 'static' },
             field: { name: 'Очистити кеш плагіна', description: 'Зіставлення фільмів та списки серій' },
-            onChange: function () {
-                matchCache.clear();
-                treeCache.clear();
-                Lampa.Noty.show('UAFLIX: кеш очищено');
+            onRender: function (item) {
+                item.on('hover:enter', function () {
+                    matchCache.clear();
+                    treeCache.clear();
+                    Lampa.Noty.show('UAFLIX: кеш очищено');
+                });
             }
         });
     }
