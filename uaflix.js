@@ -309,9 +309,14 @@
         // Playback
         // ---------------------------------------------------------------
 
+        // zetvideo.net's CORS header is hardcoded to its own origin, so hls.js
+        // (running as page JS) gets blocked fetching the m3u8 directly, same
+        // as the resolver pages. The proxy Worker also rewrites URLs *inside*
+        // m3u8 playlists to route variant playlists/segments back through
+        // itself, so only the initial URL needs wrapping here.
         function playSingle(file, title, poster) {
             Lampa.Player.play({
-                url: file,
+                url: viaProxy(file),
                 title: title,
                 poster: poster || ''
             });
@@ -320,13 +325,13 @@
         function playFromPlaylist(playlist, startIndex, movie) {
             var item = playlist[startIndex];
             Lampa.Player.play({
-                url: item.url,
+                url: viaProxy(item.url),
                 title: (movie.title || movie.name || '') + ' — ' + item.title,
                 poster: item.poster || ''
             });
             if (Lampa.Player.playlist) {
                 Lampa.Player.playlist(playlist.map(function (p) {
-                    return { title: p.title, url: p.url, poster: p.poster };
+                    return { title: p.title, url: viaProxy(p.url), poster: p.poster };
                 }), startIndex);
             }
         }
