@@ -179,13 +179,91 @@
                     return;
                 }
 
+                var series = seriesSlugAndEpisode(url);
+
                 onOk({
                     url: url,
                     year: yearMatch ? parseInt(yearMatch[1], 10) : 0,
                     kind: idMatch[1],   // 'vod' | 'serial'
-                    zid: idMatch[2]
+                    zid: idMatch[2],
+                    series: series,                                          // {slug, season, episode} or null
+                    episodes: series ? discoverEpisodes(html, series.slug) : null
                 });
             }, onErr);
+        }
+
+        // ---------------------------------------------------------------
+        // "In-progress" series support: uafix.net doesn't expose a full
+        // episode list for these (unlike the /serial/ JSON tree) — each
+        // episode is its own page at a predictable URL, and the site links
+        // a couple of neighbouring episodes from any given episode page.
+        // We harvest those links to build a best-effort episode list.
+        // ---------------------------------------------------------------
+
+        function pad2(n) {
+            n = String(n);
+            return n.length < 2 ? '0' + n : n;
+        }
+
+        function escapeRegExp(s) {
+            return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        }
+
+        function seriesSlugAndEpisode(url) {
+            var m = /\/serials\/([a-z0-9\-]+)\/season-(\d+)-episode-(\d+)\/?/.exec(url);
+            if (!m) return null;
+            return { slug: m[1], season: parseInt(m[2], 10), episode: parseInt(m[3], 10) };
+        }
+
+        function episodeUrl(slug, season, episode) {
+            return baseUrl() + '/serials/' + slug + '/season-' + pad2(season) + '-episode-' + pad2(episode) + '/';
+        }
+
+        // Only counts season-XX-episode-YY links that belong to *this* slug —
+        // pages routinely also link episodes of unrelated shows (related/
+        // recently-watched widgets), which would otherwise contaminate the list.
+        function discoverEpisodes(html, slug) {
+            var found = {};
+            var re = new RegExp('/serials/' + escapeRegExp(slug) + '/season-(\\d+)-episode-(\\d+)', 'g');
+            var m;
+            while ((m = re.exec(html))) {
+                var season = parseInt(m[1], 10), episode = parseInt(m[2], 10);
+                found[season + '_' + episode] = { season: season, episode: episode };
+            }
+            var list = [];
+            for (var k in found) if (found.hasOwnProperty(k)) list.push(found[k]);
+            list.sort(function (a, b) { return a.season - b.season || a.episode - b.episode; });
+            return list;
+        }
+
+        // Resolves every discovered episode to a playable file in parallel
+        // and returns them sorted, ready for buildPlaylist()-style playback.
+        function buildVodPlaylist(slug, episodesList, onDone) {
+            var results = [];
+            var remaining = episodesList.length;
+
+            episodesList.forEach(function (ep) {
+                var url = episodeUrl(slug, ep.season, ep.episode);
+                resolvePage(url, function (pageInfo) {
+                    if (pageInfo.kind !== 'vod') { finish(); return; }
+                    resolveVod(pageInfo.zid, function (res) {
+                        results.push({
+                            season: ep.season,
+                            episode: ep.episode,
+                            title: 'Сезон ' + ep.season + ', серія ' + ep.episode,
+                            file: res.file,
+                            poster: res.poster
+                        });
+                        finish();
+                    }, finish);
+                }, finish);
+            });
+
+            function finish() {
+                if (--remaining > 0) return;
+                results.sort(function (a, b) { return a.season - b.season || a.episode - b.episode; });
+                onDone(results);
+            }
         }
 
         // ---------------------------------------------------------------
@@ -409,8 +487,45 @@
             });
         }
 
+        // 'vod' kind, series: an in-progress show without a full /serial/
+        // archive. Harvest whatever neighbouring episodes uafix.net links
+        // from the matched page, resolve them all, and offer the same
+        // "Серія" picker as the full-archive path — so next/prev works via
+        // Lampa.Player's playlist for whatever's been discovered so far.
+        function handleVodSeries(picked, movie) {
+            var info = picked.info;
+
+            if (!info.series) {
+                // couldn't parse season/episode from the URL — fall back to a single episode
+                Lampa.Loading.start();
+                resolveVod(info.zid, function (res) {
+                    Lampa.Loading.stop();
+                    playSingle(res.file, movie.title || movie.name || picked.candidate.title, res.poster);
+                }, function (a, b) {
+                    Lampa.Loading.stop();
+                    showError('UAFLIX: не вдалося отримати відео', { a: a, b: b });
+                });
+                return;
+            }
+
+            var series = info.series;
+            var episodesList = (info.episodes && info.episodes.length) ? info.episodes : [{ season: series.season, episode: series.episode }];
+
+            Lampa.Loading.start();
+            buildVodPlaylist(series.slug, episodesList, function (resolved) {
+                Lampa.Loading.stop();
+
+                if (!resolved.length) { showError('UAFLIX: не вдалося зібрати список серій'); return; }
+
+                var playlist = buildPlaylist(resolved);
+                pickFromList('Серія', playlist, function (idx) {
+                    playFromPlaylist(playlist, idx, movie);
+                });
+            });
+        }
+
         function handleResolved(picked, movie) {
-            // picked = {candidate, info: {url, year, kind, zid}}
+            // picked = {candidate, info: {url, year, kind, zid, series, episodes}}
             var info = picked.info;
 
             if (info.kind === 'serial') {
@@ -418,16 +533,14 @@
                 return;
             }
 
-            // 'vod' kind: single file. For series this means an in-progress
-            // show without a full archive on the site — V1 just plays the
-            // matched episode; full episode-by-episode browsing for this
-            // case is a planned follow-up.
+            if (picked.candidate.type === 'series') {
+                handleVodSeries(picked, movie);
+                return;
+            }
+
             Lampa.Loading.start();
             resolveVod(info.zid, function (res) {
                 Lampa.Loading.stop();
-                if (picked.candidate.type === 'series') {
-                    showError('UAFLIX: цей серіал ще не має повного архіву на сайті, доступна лише ця серія');
-                }
                 playSingle(res.file, movie.title || movie.name || picked.candidate.title, res.poster);
             }, function (a, b) {
                 Lampa.Loading.stop();
