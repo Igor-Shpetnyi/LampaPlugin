@@ -1,0 +1,4 @@
+{
+  "main_module": "cors-proxy-worker.js",
+  "compatibility_date": "2024-09-01"
+}

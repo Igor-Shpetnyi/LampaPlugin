@@ -19,6 +19,13 @@
 
         var DOMAIN_KEY = 'uaflix_domain';
         var DEFAULT_DOMAIN = 'uafix.net';
+        var PROXY_KEY = 'uaflix_proxy';
+        // uafix.net and zetvideo.net send no Access-Control-Allow-Origin header,
+        // so Lampa.Reguest (plain browser fetch/XHR under the hood) gets blocked
+        // by CORS. This Worker fetches server-side and re-serves with an open
+        // CORS header. Leave empty in settings to call sites directly (e.g. on
+        // an Android build where the network layer might bypass CORS).
+        var DEFAULT_PROXY = 'https://uaflix-cors-proxy.igor-shpetnyi.workers.dev/?url=';
         var MATCH_CACHE_KEY = 'uaflix_match_cache';
         var TREE_CACHE_KEY = 'uaflix_tree_cache';
         var MATCH_TTL = 1000 * 60 * 60 * 24 * 14; // 14 days
@@ -31,6 +38,15 @@
 
         function baseUrl() {
             return 'https://' + domain();
+        }
+
+        function proxy() {
+            return Lampa.Storage.get(PROXY_KEY, DEFAULT_PROXY);
+        }
+
+        function viaProxy(url) {
+            var p = proxy();
+            return p ? (p + encodeURIComponent(url)) : url;
         }
 
         // Generic TTL key-value cache stored in Lampa.Storage, modeled after
@@ -67,11 +83,11 @@
 
         // ---------------------------------------------------------------
         // Network — thin wrapper around Lampa.Reguest.
-        // Isolated in one place: uafix.net needs no special headers (verified
-        // via curl), zetvideo.net needs a *non-empty* Referer header present
-        // (verified — the exact value doesn't matter). Wrapped in try/catch
-        // and logged so failures are diagnosable via remote-debug console
-        // instead of just showing a generic toast.
+        // uafix.net/zetvideo.net send no Access-Control-Allow-Origin header,
+        // so requests are routed through a small CORS-proxy Worker (see
+        // DEFAULT_PROXY above), which also sets the Referer header that
+        // zetvideo.net requires. Wrapped in try/catch and logged so failures
+        // are diagnosable via remote-debug console instead of just a toast.
         // ---------------------------------------------------------------
 
         function log() {
@@ -80,34 +96,24 @@
             if (window.console && console.log) console.log.apply(console, args);
         }
 
-        function rawRequest(url, onOk, onErr, headers) {
-            log('request ->', url, headers ? '(with Referer)' : '');
+        function request(url, onOk, onErr) {
+            var proxied = viaProxy(url);
+            log('request ->', proxied);
             try {
                 var network = new Lampa.Reguest();
                 network.timeout(15000);
 
-                var params = { dataType: 'text' };
-                if (headers) params.headers = headers;
-
-                network.silent(url, function (text) {
+                network.silent(proxied, function (text) {
                     log('request ok <-', url, 'len=' + (text ? text.length : 0));
                     onOk(text);
                 }, function (a, b) {
                     log('request FAILED <-', url, a, b);
                     if (onErr) onErr(a, b);
-                }, false, params);
+                }, false, { dataType: 'text' });
             } catch (e) {
                 log('request THREW', url, e && e.message, e);
                 if (onErr) onErr(e);
             }
-        }
-
-        function request(url, onOk, onErr) {
-            rawRequest(url, onOk, onErr, null);
-        }
-
-        function requestWithReferer(url, onOk, onErr) {
-            rawRequest(url, onOk, onErr, { 'Referer': baseUrl() + '/' });
         }
 
         // ---------------------------------------------------------------
@@ -189,7 +195,7 @@
         // /vod/{id} -> single Playerjs config, file is a plain URL string.
         function resolveVod(id, onOk, onErr) {
             var url = 'https://zetvideo.net/vod/' + id;
-            requestWithReferer(url, function (html) {
+            request(url, function (html) {
                 var fileMatch = /file\s*:\s*"([^"]+)"/.exec(html);
                 var posterMatch = /poster\s*:\s*"([^"]*)"/.exec(html);
                 if (!fileMatch) { onErr('no_file'); return; }
@@ -203,7 +209,7 @@
             if (cached) { onOk(cached); return; }
 
             var url = 'https://zetvideo.net/serial/' + id;
-            requestWithReferer(url, function (html) {
+            request(url, function (html) {
                 // file:'[ ... ]', forbidden_quality: ...
                 var fileMatch = /file\s*:\s*'([\s\S]*?)'\s*,\s*\r?\n?\s*forbidden_quality/.exec(html);
                 if (!fileMatch) { onErr('no_tree'); return; }
@@ -485,7 +491,7 @@
         // force the label to always render.
         function ensureButtonStyle() {
             if ($('#uaflix-style').length) return;
-            $('<style id="uaflix-style">.uaflix-btn span{opacity:1 !important;width:auto !important;max-width:none !important;margin-left:.5em;}</style>').appendTo('head');
+            $('<style id="uaflix-style">.uaflix-btn span{display:inline !important;opacity:1 !important;width:auto !important;max-width:none !important;margin-left:.5em;}</style>').appendTo('head');
         }
 
         function injectButton(render, movie) {
@@ -529,6 +535,13 @@
             param: { name: DOMAIN_KEY, type: 'input', default: DEFAULT_DOMAIN },
             field: { name: 'Домен сайту', description: 'На випадок якщо основний домен заблоковано/змінено' },
             onChange: function (value) { Lampa.Storage.set(DOMAIN_KEY, value); }
+        });
+
+        Lampa.SettingsApi.addParam({
+            component: 'uaflix',
+            param: { name: PROXY_KEY, type: 'input', default: DEFAULT_PROXY },
+            field: { name: 'CORS-проксі', description: 'Порожнє значення = звертатись напряму (без проксі)' },
+            onChange: function (value) { Lampa.Storage.set(PROXY_KEY, value); }
         });
 
         Lampa.SettingsApi.addParam({
