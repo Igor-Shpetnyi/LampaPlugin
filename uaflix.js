@@ -40,8 +40,14 @@
             return 'https://' + domain();
         }
 
+        var PROXY_OFF = '-';
+
+        // Lampa.Storage.get() itself falls back to the default value when the
+        // stored string is empty (verified live), so an empty field can never
+        // mean "off" — a sentinel value is used instead.
         function proxy() {
-            return Lampa.Storage.get(PROXY_KEY, DEFAULT_PROXY);
+            var v = Lampa.Storage.get(PROXY_KEY, DEFAULT_PROXY);
+            return v === PROXY_OFF ? '' : v;
         }
 
         function viaProxy(url) {
@@ -672,7 +678,7 @@
         Lampa.SettingsApi.addParam({
             component: 'uaflix',
             param: { name: PROXY_KEY, type: 'input', placeholder: DEFAULT_PROXY, values: '', default: DEFAULT_PROXY },
-            field: { name: 'CORS-проксі', description: 'Порожнє значення = звертатись напряму (без проксі)' },
+            field: { name: 'CORS-проксі', description: 'Введи "-" щоб вимкнути проксі (звертатись напряму)' },
             onChange: function (value) { Lampa.Storage.set(PROXY_KEY, value); }
         });
 
