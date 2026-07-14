@@ -169,12 +169,26 @@
         // Confirmed markup:
         //   <span itemprop="dateCreated" class="year">1984</span>
         //   <iframe ... src="https://zetvideo.net/vod/22992" ...>  (or /serial/{id})
+        function landingSlug(url) {
+            var m = /\/serials\/([a-z0-9\-]+)\/?(?:$|\?)/.exec(url);
+            return m ? m[1] : null;
+        }
+
         function resolvePage(url, onOk, onErr) {
             request(url, function (html) {
                 var yearMatch = /itemprop="dateCreated" class="year">(\d{4})</.exec(html);
                 var idMatch = /zetvideo\.net\/(vod|serial)\/(\d+)/.exec(html);
 
                 if (!idMatch) {
+                    // Series *landing* pages (/serials/{slug}/) usually have no
+                    // player of their own — only individual episode pages do.
+                    // Fall back to whatever the earliest linked episode is.
+                    var slug = landingSlug(url);
+                    var episodes = slug ? discoverEpisodes(html, slug) : [];
+                    if (episodes.length) {
+                        resolvePage(episodeUrl(slug, episodes[0].season, episodes[0].episode), onOk, onErr);
+                        return;
+                    }
                     onErr('no_player');
                     return;
                 }
