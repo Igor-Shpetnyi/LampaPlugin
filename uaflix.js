@@ -11,6 +11,8 @@
         if (window.uaflix_plugin) return;
         window.uaflix_plugin = true;
 
+        log('plugin init');
+
         // ---------------------------------------------------------------
         // Config & storage
         // ---------------------------------------------------------------
@@ -65,22 +67,47 @@
 
         // ---------------------------------------------------------------
         // Network — thin wrapper around Lampa.Reguest.
-        // Isolated in one place: uafix/zetvideo only require a *non-empty*
-        // Referer header to be present (verified — the exact value doesn't
-        // matter), everything else is a plain GET.
+        // Isolated in one place: uafix.net needs no special headers (verified
+        // via curl), zetvideo.net needs a *non-empty* Referer header present
+        // (verified — the exact value doesn't matter). Wrapped in try/catch
+        // and logged so failures are diagnosable via remote-debug console
+        // instead of just showing a generic toast.
         // ---------------------------------------------------------------
 
+        function log() {
+            var args = Array.prototype.slice.call(arguments);
+            args.unshift('[UAFLIX]');
+            if (window.console && console.log) console.log.apply(console, args);
+        }
+
+        function rawRequest(url, onOk, onErr, headers) {
+            log('request ->', url, headers ? '(with Referer)' : '');
+            try {
+                var network = new Lampa.Reguest();
+                network.timeout(15000);
+
+                var params = { dataType: 'text' };
+                if (headers) params.headers = headers;
+
+                network.silent(url, function (text) {
+                    log('request ok <-', url, 'len=' + (text ? text.length : 0));
+                    onOk(text);
+                }, function (a, b) {
+                    log('request FAILED <-', url, a, b);
+                    if (onErr) onErr(a, b);
+                }, false, params);
+            } catch (e) {
+                log('request THREW', url, e && e.message, e);
+                if (onErr) onErr(e);
+            }
+        }
+
         function request(url, onOk, onErr) {
-            var network = new Lampa.Reguest();
-            network.timeout(15000);
-            network.silent(url, function (text) {
-                onOk(text);
-            }, function (a, b) {
-                if (onErr) onErr(a, b);
-            }, false, {
-                dataType: 'text',
-                headers: { 'Referer': baseUrl() + '/' }
-            });
+            rawRequest(url, onOk, onErr, null);
+        }
+
+        function requestWithReferer(url, onOk, onErr) {
+            rawRequest(url, onOk, onErr, { 'Referer': baseUrl() + '/' });
         }
 
         // ---------------------------------------------------------------
@@ -162,7 +189,7 @@
         // /vod/{id} -> single Playerjs config, file is a plain URL string.
         function resolveVod(id, onOk, onErr) {
             var url = 'https://zetvideo.net/vod/' + id;
-            request(url, function (html) {
+            requestWithReferer(url, function (html) {
                 var fileMatch = /file\s*:\s*"([^"]+)"/.exec(html);
                 var posterMatch = /poster\s*:\s*"([^"]*)"/.exec(html);
                 if (!fileMatch) { onErr('no_file'); return; }
@@ -176,7 +203,7 @@
             if (cached) { onOk(cached); return; }
 
             var url = 'https://zetvideo.net/serial/' + id;
-            request(url, function (html) {
+            requestWithReferer(url, function (html) {
                 // file:'[ ... ]', forbidden_quality: ...
                 var fileMatch = /file\s*:\s*'([\s\S]*?)'\s*,\s*\r?\n?\s*forbidden_quality/.exec(html);
                 if (!fileMatch) { onErr('no_tree'); return; }
@@ -302,7 +329,8 @@
         // UI flow
         // ---------------------------------------------------------------
 
-        function showError(text) {
+        function showError(text, technical) {
+            if (technical !== undefined) log('error:', text, technical);
             Lampa.Noty.show(text);
         }
 
@@ -364,9 +392,9 @@
                 } else {
                     pickFromList('Озвучення', tree, function (idx) { afterVoice(tree[idx]); });
                 }
-            }, function () {
+            }, function (a, b) {
                 Lampa.Loading.stop();
-                showError('UAFLIX: не вдалося завантажити список серій');
+                showError('UAFLIX: не вдалося завантажити список серій', { a: a, b: b });
             });
         }
 
@@ -390,9 +418,9 @@
                     showError('UAFLIX: цей серіал ще не має повного архіву на сайті, доступна лише ця серія');
                 }
                 playSingle(res.file, movie.title || movie.name || picked.candidate.title, res.poster);
-            }, function () {
+            }, function (a, b) {
                 Lampa.Loading.stop();
-                showError('UAFLIX: не вдалося отримати відео');
+                showError('UAFLIX: не вдалося отримати відео', { a: a, b: b });
             });
         }
 
@@ -437,9 +465,9 @@
                         handleResolved(picked, movie);
                     });
                 });
-            }, function () {
+            }, function (a, b) {
                 Lampa.Loading.stop();
-                showError('UAFLIX: сайт недоступний (' + domain() + ')');
+                showError('UAFLIX: сайт недоступний (' + domain() + ')', { a: a, b: b });
             });
         }
 
@@ -451,8 +479,19 @@
         // one place to fix.
         // ---------------------------------------------------------------
 
+        // Lampa's default button CSS hides/collapses the label span until the
+        // button is focused (a compact icon-first design shared by the built-in
+        // buttons). Our button has no icon, so unfocused it looked empty —
+        // force the label to always render.
+        function ensureButtonStyle() {
+            if ($('#uaflix-style').length) return;
+            $('<style id="uaflix-style">.uaflix-btn span{opacity:1 !important;width:auto !important;max-width:none !important;margin-left:.5em;}</style>').appendTo('head');
+        }
+
         function injectButton(render, movie) {
             if (render.find('.uaflix-btn').length) return;
+
+            ensureButtonStyle();
 
             var btn = $('<div class="full-start__button selector uaflix-btn"><span>UAFLIX</span></div>');
             btn.on('hover:enter', function () { startSearchFlow(movie); });
