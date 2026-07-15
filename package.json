@@ -1,0 +1,7 @@
+{
+  "name": "lampaplugin-ua-proxy",
+  "private": true,
+  "dependencies": {
+    "socks-proxy-agent": "^8.0.4"
+  }
+}
