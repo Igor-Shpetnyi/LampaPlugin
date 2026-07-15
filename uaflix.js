@@ -214,28 +214,51 @@
             if (!idMatch) return null;
 
             var series = seriesSlugAndEpisode(url);
+            // Playerjs preview meta and the episode title (in Ukrainian
+            // guillemets, e.g. Спадок 1 серія «This Is the Part...») live in
+            // the same og/description tags on every content page — harvested
+            // here so probing an episode's existence also gets us its real
+            // title/poster for free, no extra request.
+            var titleMatch = /«([^»]+)»/.exec(html);
+            var posterMatch = /property="og:image" content="([^"]+)"/.exec(html);
+
             return {
                 url: url,
                 year: yearMatch ? parseInt(yearMatch[1], 10) : 0,
                 kind: idMatch[1],   // 'vod' | 'serial'
                 zid: idMatch[2],
                 series: series,                                          // {slug, season, episode} or null
-                episodes: series ? discoverEpisodes(html, series.slug) : null
+                episodes: series ? discoverEpisodes(html, series.slug) : null,
+                episodeTitle: titleMatch ? decodeEntities(titleMatch[1]) : '',
+                poster: posterMatch ? posterMatch[1] : '',
+                seasonCount: discoverSeasonCount(html)
             };
         }
 
         function resolvePageVia(requester, url, onOk, onErr) {
             requester(url, function (html) {
                 var info = parsePageHtml(url, html);
-                if (info) { onOk(info); return; }
+                var seasonCountHere = discoverSeasonCount(html);
+
+                if (info) {
+                    info.seasonCount = Math.max(info.seasonCount || 1, seasonCountHere);
+                    onOk(info);
+                    return;
+                }
 
                 // Series *landing* pages (/serials/{slug}/) usually have no
                 // player of their own — only individual episode pages do.
-                // Fall back to whatever the earliest linked episode is.
+                // Fall back to whatever the earliest linked episode is, but
+                // keep the season count we *did* see here (landing pages
+                // reliably list every season; individual episode pages
+                // often only mention their own).
                 var slug = landingSlug(url);
                 var episodes = slug ? discoverEpisodes(html, slug) : [];
                 if (episodes.length) {
-                    resolvePageVia(requester, episodeUrl(slug, episodes[0].season, episodes[0].episode), onOk, onErr);
+                    resolvePageVia(requester, episodeUrl(slug, episodes[0].season, episodes[0].episode), function (innerInfo) {
+                        innerInfo.seasonCount = Math.max(innerInfo.seasonCount || 1, seasonCountHere);
+                        onOk(innerInfo);
+                    }, onErr);
                     return;
                 }
                 onErr('no_player');
@@ -282,6 +305,8 @@
         // Only counts season-XX-episode-YY links that belong to *this* slug —
         // pages routinely also link episodes of unrelated shows (related/
         // recently-watched widgets), which would otherwise contaminate the list.
+        // Used only for the landing-page fallback in resolvePageVia() below —
+        // real per-season episode lists come from probeSeasonEpisodes().
         function discoverEpisodes(html, slug) {
             var found = {};
             var re = new RegExp('/serials/' + escapeRegExp(slug) + '/season-(\\d+)-episode-(\\d+)', 'g');
@@ -296,34 +321,55 @@
             return list;
         }
 
-        // Resolves every discovered episode to a playable file in parallel
-        // and returns them sorted, ready for buildPlaylist()-style playback.
-        function buildVodPlaylist(slug, episodesList, onDone) {
-            var results = [];
-            var remaining = episodesList.length;
+        // Series *landing* pages list every season as plain "Сезон N" text
+        // (individual episode pages usually only mention their own season),
+        // so this is only meaningful on whatever page resolvePageVia() first
+        // lands on — it takes the max across the whole resolve chain.
+        function discoverSeasonCount(html) {
+            var re = /Сезон\s*(\d+)/gi;
+            var max = 0, m;
+            while ((m = re.exec(html))) {
+                var n = parseInt(m[1], 10);
+                if (n > max) max = n;
+            }
+            return max || 1;
+        }
 
-            episodesList.forEach(function (ep) {
-                var url = episodeUrl(slug, ep.season, ep.episode);
-                resolvePage(url, function (pageInfo) {
-                    if (pageInfo.kind !== 'vod') { finish(); return; }
-                    resolveVod(pageInfo.zid, function (res) {
-                        results.push({
-                            season: ep.season,
-                            episode: ep.episode,
-                            title: 'Сезон ' + ep.season + ', серія ' + ep.episode,
-                            file: res.file,
-                            poster: res.poster
-                        });
-                        finish();
-                    }, finish);
+        var MAX_EPISODES_PER_SEASON = 24;
+
+        // Cheap pass: only checks existence + harvests title/poster for each
+        // episode slot in a season (one page fetch each, no zetvideo/m3u8
+        // resolution) — the actual video is resolved lazily, per episode,
+        // only once the user picks or navigates to it.
+        function probeSeasonEpisodes(slug, season, onDone) {
+            var results = [];
+            var remaining = MAX_EPISODES_PER_SEASON;
+
+            var _loop = function (episode) {
+                resolvePage(episodeUrl(slug, season, episode), function (info) {
+                    results.push({
+                        season: season,
+                        episode: episode,
+                        title: info.episodeTitle || ('Серія ' + episode),
+                        poster: info.poster || ''
+                    });
+                    finish();
                 }, finish);
-            });
+            };
+            for (var e = 1; e <= MAX_EPISODES_PER_SEASON; e++) _loop(e);
 
             function finish() {
                 if (--remaining > 0) return;
-                results.sort(function (a, b) { return a.season - b.season || a.episode - b.episode; });
+                results.sort(function (a, b) { return a.episode - b.episode; });
                 onDone(results);
             }
+        }
+
+        // Resolves one specific episode's playable file (fast proxy, UA fallback).
+        function resolveEpisode(slug, season, episode, onOk, onErr) {
+            resolvePage(episodeUrl(slug, season, episode), function (info) {
+                resolveVod(info.zid, onOk, onErr);
+            }, onErr);
         }
 
         // ---------------------------------------------------------------
@@ -461,32 +507,46 @@
         // Playback
         // ---------------------------------------------------------------
 
+        // Resume position, matched to real balancer plugin source (Online's
+        // rezka.js): a stable hash of season+episode+original title (or just
+        // the title for movies) keys into Lampa's own watched-progress store.
+        function timelineFor(movie, seasonKey, episodeKey) {
+            var title = movie.original_title || movie.original_name || movie.title || movie.name || '';
+            var key = (seasonKey !== undefined && seasonKey !== null) ? [seasonKey, episodeKey, title].join('') : title;
+            return Lampa.Timeline.view(Lampa.Utils.hash(key));
+        }
+
         // zetvideo.net's CORS header is hardcoded to its own origin, so hls.js
         // (running as page JS) gets blocked fetching the m3u8 directly, same
         // as the resolver pages. The proxy Worker also rewrites URLs *inside*
         // m3u8 playlists to route variant playlists/segments back through
         // itself, so only the initial URL needs wrapping here.
-        function playSingle(file, title, poster, useUa) {
+        function playSingle(file, title, poster, useUa, timeline) {
             var wrap = useUa ? viaUaProxy : viaProxy;
             Lampa.Player.play({
                 url: wrap(file),
                 title: title,
-                poster: poster || ''
+                poster: poster || '',
+                timeline: timeline
             });
         }
 
+        // playlist: [{title, url, poster, timeline}], all URLs already
+        // resolved (used by the full-archive /serial/ path, where the whole
+        // tree — and every m3u8 URL in it — comes back in one request).
         function playFromPlaylist(playlist, startIndex, movie, useUa) {
             var wrap = useUa ? viaUaProxy : viaProxy;
             var item = playlist[startIndex];
             Lampa.Player.play({
                 url: wrap(item.url),
                 title: (movie.title || movie.name || '') + ' — ' + item.title,
-                poster: item.poster || ''
+                poster: item.poster || '',
+                timeline: item.timeline
             });
             if (Lampa.Player.playlist) {
                 Lampa.Player.playlist(playlist.map(function (p) {
-                    return { title: p.title, url: wrap(p.url), poster: p.poster };
-                }), startIndex);
+                    return { title: p.title, url: wrap(p.url), poster: p.poster, timeline: p.timeline };
+                }));
             }
         }
 
@@ -524,6 +584,31 @@
             });
         }
 
+        // Same as pickFromList, but shows each episode's poster where known
+        // (real Lampa selectbox template — confirmed against bookmarks-sync.js)
+        // and pre-focuses the current/likely-next episode instead of the top.
+        function pickEpisodeList(title, list, onPick, preselectIdx) {
+            Lampa.Select.show({
+                title: title,
+                items: list.map(function (item, idx) {
+                    var entry = { title: (item.title || ('#' + (idx + 1))).trim(), idx: idx };
+                    if (item.poster) {
+                        entry.template = 'selectbox_icon';
+                        entry.icon = '<img src="' + item.poster + '" />';
+                    }
+                    if (preselectIdx === idx) entry.selected = true;
+                    return entry;
+                }),
+                onSelect: function (sel) { onPick(sel.idx); },
+                onBack: function () { Lampa.Controller.toggle('content'); }
+            });
+        }
+
+        function seasonNumberFromTitle(title) {
+            var m = /(\d+)/.exec(title || '');
+            return m ? parseInt(m[1], 10) : (title || '').trim();
+        }
+
         function handleSeriesTree(zid, movie) {
             Lampa.Loading.start();
             resolveSerialTree(zid, function (tree) {
@@ -539,8 +624,12 @@
                         var episodes = season.folder || [];
                         if (!episodes.length) { showError('UAFLIX: серії не знайдено'); return; }
 
-                        var playlist = buildPlaylist(episodes);
-                        pickFromList('Серія', playlist, function (idx) {
+                        var seasonKey = seasonNumberFromTitle(season.title);
+                        var playlist = buildPlaylist(episodes).map(function (ep) {
+                            ep.timeline = timelineFor(movie, seasonKey, ep.title);
+                            return ep;
+                        });
+                        pickEpisodeList('Серія', playlist, function (idx) {
                             playFromPlaylist(playlist, idx, movie);
                         });
                     }
@@ -564,10 +653,14 @@
         }
 
         // 'vod' kind, series: an in-progress show without a full /serial/
-        // archive. Harvest whatever neighbouring episodes uafix.net links
-        // from the matched page, resolve them all, and offer the same
-        // "Серія" picker as the full-archive path — so next/prev works via
-        // Lampa.Player's playlist for whatever's been discovered so far.
+        // archive. Season count comes from "Сезон N" labels harvested while
+        // resolving the matched page (see resolvePageVia); episodes within
+        // whichever season is chosen are discovered by probing predictable
+        // URLs (title/poster only, cheap). The actual video is resolved
+        // lazily per episode — eagerly only for the one about to play, and
+        // via a Lampa.Player.playlist() url-function (matched to real
+        // balancer plugin source, rezka.js) for the rest, so next/prev
+        // resolves on demand instead of upfront.
         function handleVodSeries(picked, movie) {
             var info = picked.info;
 
@@ -576,7 +669,7 @@
                 Lampa.Loading.start();
                 resolveVod(info.zid, function (res) {
                     Lampa.Loading.stop();
-                    playSingle(res.file, movie.title || movie.name || picked.candidate.title, res.poster, true);
+                    playSingle(res.file, movie.title || movie.name || picked.candidate.title, res.poster, true, timelineFor(movie));
                 }, function (a, b) {
                     Lampa.Loading.stop();
                     showError('UAFLIX: не вдалося отримати відео', { a: a, b: b });
@@ -585,18 +678,84 @@
             }
 
             var series = info.series;
-            var episodesList = (info.episodes && info.episodes.length) ? info.episodes : [{ season: series.season, episode: series.episode }];
+            var seasonCount = info.seasonCount || 1;
+
+            function afterSeasonChosen(season) {
+                Lampa.Loading.start();
+                probeSeasonEpisodes(series.slug, season, function (episodes) {
+                    Lampa.Loading.stop();
+                    if (!episodes.length) { showError('UAFLIX: серії не знайдено'); return; }
+
+                    var preselect = 0;
+                    for (var i = 0; i < episodes.length; i++) {
+                        if (episodes[i].season === series.season && episodes[i].episode === series.episode) { preselect = i; break; }
+                    }
+
+                    pickEpisodeList('Серія', episodes, function (idx) {
+                        playVodEpisode(series.slug, episodes, idx, movie);
+                    }, preselect);
+                });
+            }
+
+            if (seasonCount > 1) {
+                var seasons = [];
+                for (var s = 1; s <= seasonCount; s++) seasons.push({ title: 'Сезон ' + s, season: s });
+                pickFromList('Сезон', seasons, function (idx) { afterSeasonChosen(seasons[idx].season); });
+            } else {
+                afterSeasonChosen(series.season || 1);
+            }
+        }
+
+        // Resolves the chosen episode eagerly (so it can start playing right
+        // away), and registers the rest of the season as a lazily-resolved
+        // Lampa.Player.playlist() — each entry's `url` is a function Lampa
+        // calls only when the user actually navigates to it via next/prev.
+        function playVodEpisode(slug, episodes, startIndex, movie) {
+            var chosen = episodes[startIndex];
 
             Lampa.Loading.start();
-            buildVodPlaylist(series.slug, episodesList, function (resolved) {
+            resolveEpisode(slug, chosen.season, chosen.episode, function (res) {
                 Lampa.Loading.stop();
 
-                if (!resolved.length) { showError('UAFLIX: не вдалося зібрати список серій'); return; }
-
-                var playlist = buildPlaylist(resolved);
-                pickFromList('Серія', playlist, function (idx) {
-                    playFromPlaylist(playlist, idx, movie, true);
+                var title = (movie.title || movie.name || '') + ' — ' + chosen.title;
+                Lampa.Player.play({
+                    url: viaUaProxy(res.file),
+                    title: title,
+                    poster: res.poster || chosen.poster || '',
+                    timeline: timelineFor(movie, chosen.season, chosen.episode)
                 });
+
+                if (Lampa.Player.playlist) {
+                    var playlist = episodes.map(function (ep, idx) {
+                        if (idx === startIndex) {
+                            return {
+                                url: viaUaProxy(res.file),
+                                title: ep.title,
+                                poster: res.poster || ep.poster || '',
+                                timeline: timelineFor(movie, ep.season, ep.episode)
+                            };
+                        }
+                        var cell = {
+                            title: ep.title,
+                            poster: ep.poster || '',
+                            timeline: timelineFor(movie, ep.season, ep.episode),
+                            url: function (call) {
+                                resolveEpisode(slug, ep.season, ep.episode, function (lazyRes) {
+                                    cell.url = viaUaProxy(lazyRes.file);
+                                    call();
+                                }, function () {
+                                    cell.url = '';
+                                    call();
+                                });
+                            }
+                        };
+                        return cell;
+                    });
+                    Lampa.Player.playlist(playlist);
+                }
+            }, function (a, b) {
+                Lampa.Loading.stop();
+                showError('UAFLIX: не вдалося отримати відео', { a: a, b: b });
             });
         }
 
@@ -617,7 +776,7 @@
             Lampa.Loading.start();
             resolveVod(info.zid, function (res) {
                 Lampa.Loading.stop();
-                playSingle(res.file, movie.title || movie.name || picked.candidate.title, res.poster);
+                playSingle(res.file, movie.title || movie.name || picked.candidate.title, res.poster, false, timelineFor(movie));
             }, function (a, b) {
                 Lampa.Loading.stop();
                 showError('UAFLIX: не вдалося отримати відео', { a: a, b: b });
