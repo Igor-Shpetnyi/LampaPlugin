@@ -26,6 +26,15 @@
         // CORS header. Leave empty in settings to call sites directly (e.g. on
         // an Android build where the network layer might bypass CORS).
         var DEFAULT_PROXY = 'https://uaflix-cors-proxy.igor-shpetnyi.workers.dev/?url=';
+        // Some content (actively-airing series episodes) is geo-gated to
+        // Ukrainian IPs at the zetvideo.net level. The Cloudflare Worker above
+        // can't satisfy that (its TCP Sockets API can't do proper SNI through
+        // a proxied tunnel — confirmed, not just untried), so this second,
+        // slower proxy routes through a rotating free Ukrainian SOCKS5 proxy
+        // via a real Node.js runtime (Vercel), used only as a fallback when
+        // the fast proxy comes back without a player.
+        var UA_PROXY_KEY = 'uaflix_ua_proxy';
+        var DEFAULT_UA_PROXY = 'https://lampa-plugin-eta.vercel.app/api/ua-proxy?url=';
         var MATCH_CACHE_KEY = 'uaflix_match_cache';
         var TREE_CACHE_KEY = 'uaflix_tree_cache';
         var MATCH_TTL = 1000 * 60 * 60 * 24 * 14; // 14 days
@@ -52,6 +61,16 @@
 
         function viaProxy(url) {
             var p = proxy();
+            return p ? (p + encodeURIComponent(url)) : url;
+        }
+
+        function uaProxy() {
+            var v = Lampa.Storage.get(UA_PROXY_KEY, DEFAULT_UA_PROXY);
+            return v === PROXY_OFF ? '' : v;
+        }
+
+        function viaUaProxy(url) {
+            var p = uaProxy();
             return p ? (p + encodeURIComponent(url)) : url;
         }
 
@@ -102,24 +121,33 @@
             if (window.console && console.log) console.log.apply(console, args);
         }
 
-        function request(url, onOk, onErr) {
-            var proxied = viaProxy(url);
-            log('request ->', proxied);
+        function requestRaw(proxiedUrl, origUrl, timeoutMs, onOk, onErr) {
+            log('request ->', proxiedUrl);
             try {
                 var network = new Lampa.Reguest();
-                network.timeout(15000);
+                network.timeout(timeoutMs);
 
-                network.silent(proxied, function (text) {
-                    log('request ok <-', url, 'len=' + (text ? text.length : 0));
+                network.silent(proxiedUrl, function (text) {
+                    log('request ok <-', origUrl, 'len=' + (text ? text.length : 0));
                     onOk(text);
                 }, function (a, b) {
-                    log('request FAILED <-', url, a, b);
+                    log('request FAILED <-', origUrl, a, b);
                     if (onErr) onErr(a, b);
                 }, false, { dataType: 'text' });
             } catch (e) {
-                log('request THREW', url, e && e.message, e);
+                log('request THREW', origUrl, e && e.message, e);
                 if (onErr) onErr(e);
             }
+        }
+
+        function request(url, onOk, onErr) {
+            requestRaw(viaProxy(url), url, 15000, onOk, onErr);
+        }
+
+        // Slower (rotating free proxy), used only as a fallback for content
+        // the fast proxy can't reach.
+        function requestUa(url, onOk, onErr) {
+            requestRaw(viaUaProxy(url), url, 25000, onOk, onErr);
         }
 
         // ---------------------------------------------------------------
@@ -180,36 +208,48 @@
             return m ? m[1] : null;
         }
 
-        function resolvePage(url, onOk, onErr) {
-            request(url, function (html) {
-                var yearMatch = /itemprop="dateCreated" class="year">(\d{4})</.exec(html);
-                var idMatch = /zetvideo\.net\/(vod|serial)\/(\d+)/.exec(html);
+        function parsePageHtml(url, html) {
+            var yearMatch = /itemprop="dateCreated" class="year">(\d{4})</.exec(html);
+            var idMatch = /zetvideo\.net\/(vod|serial)\/(\d+)/.exec(html);
+            if (!idMatch) return null;
 
-                if (!idMatch) {
-                    // Series *landing* pages (/serials/{slug}/) usually have no
-                    // player of their own — only individual episode pages do.
-                    // Fall back to whatever the earliest linked episode is.
-                    var slug = landingSlug(url);
-                    var episodes = slug ? discoverEpisodes(html, slug) : [];
-                    if (episodes.length) {
-                        resolvePage(episodeUrl(slug, episodes[0].season, episodes[0].episode), onOk, onErr);
-                        return;
-                    }
-                    onErr('no_player');
+            var series = seriesSlugAndEpisode(url);
+            return {
+                url: url,
+                year: yearMatch ? parseInt(yearMatch[1], 10) : 0,
+                kind: idMatch[1],   // 'vod' | 'serial'
+                zid: idMatch[2],
+                series: series,                                          // {slug, season, episode} or null
+                episodes: series ? discoverEpisodes(html, series.slug) : null
+            };
+        }
+
+        function resolvePageVia(requester, url, onOk, onErr) {
+            requester(url, function (html) {
+                var info = parsePageHtml(url, html);
+                if (info) { onOk(info); return; }
+
+                // Series *landing* pages (/serials/{slug}/) usually have no
+                // player of their own — only individual episode pages do.
+                // Fall back to whatever the earliest linked episode is.
+                var slug = landingSlug(url);
+                var episodes = slug ? discoverEpisodes(html, slug) : [];
+                if (episodes.length) {
+                    resolvePageVia(requester, episodeUrl(slug, episodes[0].season, episodes[0].episode), onOk, onErr);
                     return;
                 }
-
-                var series = seriesSlugAndEpisode(url);
-
-                onOk({
-                    url: url,
-                    year: yearMatch ? parseInt(yearMatch[1], 10) : 0,
-                    kind: idMatch[1],   // 'vod' | 'serial'
-                    zid: idMatch[2],
-                    series: series,                                          // {slug, season, episode} or null
-                    episodes: series ? discoverEpisodes(html, series.slug) : null
-                });
+                onErr('no_player');
             }, onErr);
+        }
+
+        // Some content (actively-airing series episodes) is geo-gated and
+        // comes back with no player at all via the fast proxy — retry the
+        // whole resolution through the Ukraine proxy before giving up.
+        function resolvePage(url, onOk, onErr) {
+            resolvePageVia(request, url, onOk, function () {
+                log('resolvePage: fast proxy found no player, retrying via UA proxy', url);
+                resolvePageVia(requestUa, url, onOk, onErr);
+            });
         }
 
         // ---------------------------------------------------------------
@@ -290,14 +330,28 @@
         // zetvideo.net parsing
         // ---------------------------------------------------------------
 
+        function parseVodHtml(html) {
+            var fileMatch = /file\s*:\s*"([^"]+)"/.exec(html);
+            if (!fileMatch) return null;
+            var posterMatch = /poster\s*:\s*"([^"]*)"/.exec(html);
+            return { file: fileMatch[1], poster: posterMatch ? posterMatch[1] : '' };
+        }
+
         // /vod/{id} -> single Playerjs config, file is a plain URL string.
+        // Same geo-gate as resolvePage() — retry via the Ukraine proxy if the
+        // fast proxy comes back without a `file:` entry (blocked content
+        // renders a trailer-only page with no player config at all).
         function resolveVod(id, onOk, onErr) {
             var url = 'https://zetvideo.net/vod/' + id;
             request(url, function (html) {
-                var fileMatch = /file\s*:\s*"([^"]+)"/.exec(html);
-                var posterMatch = /poster\s*:\s*"([^"]*)"/.exec(html);
-                if (!fileMatch) { onErr('no_file'); return; }
-                onOk({ file: fileMatch[1], poster: posterMatch ? posterMatch[1] : '' });
+                var res = parseVodHtml(html);
+                if (res) { onOk(res); return; }
+                log('resolveVod: fast proxy found no file, retrying via UA proxy', id);
+                requestUa(url, function (html2) {
+                    var res2 = parseVodHtml(html2);
+                    if (res2) { onOk(res2); return; }
+                    onErr('no_file');
+                }, onErr);
             }, onErr);
         }
 
@@ -412,24 +466,26 @@
         // as the resolver pages. The proxy Worker also rewrites URLs *inside*
         // m3u8 playlists to route variant playlists/segments back through
         // itself, so only the initial URL needs wrapping here.
-        function playSingle(file, title, poster) {
+        function playSingle(file, title, poster, useUa) {
+            var wrap = useUa ? viaUaProxy : viaProxy;
             Lampa.Player.play({
-                url: viaProxy(file),
+                url: wrap(file),
                 title: title,
                 poster: poster || ''
             });
         }
 
-        function playFromPlaylist(playlist, startIndex, movie) {
+        function playFromPlaylist(playlist, startIndex, movie, useUa) {
+            var wrap = useUa ? viaUaProxy : viaProxy;
             var item = playlist[startIndex];
             Lampa.Player.play({
-                url: viaProxy(item.url),
+                url: wrap(item.url),
                 title: (movie.title || movie.name || '') + ' — ' + item.title,
                 poster: item.poster || ''
             });
             if (Lampa.Player.playlist) {
                 Lampa.Player.playlist(playlist.map(function (p) {
-                    return { title: p.title, url: viaProxy(p.url), poster: p.poster };
+                    return { title: p.title, url: wrap(p.url), poster: p.poster };
                 }), startIndex);
             }
         }
@@ -520,7 +576,7 @@
                 Lampa.Loading.start();
                 resolveVod(info.zid, function (res) {
                     Lampa.Loading.stop();
-                    playSingle(res.file, movie.title || movie.name || picked.candidate.title, res.poster);
+                    playSingle(res.file, movie.title || movie.name || picked.candidate.title, res.poster, true);
                 }, function (a, b) {
                     Lampa.Loading.stop();
                     showError('UAFLIX: не вдалося отримати відео', { a: a, b: b });
@@ -539,7 +595,7 @@
 
                 var playlist = buildPlaylist(resolved);
                 pickFromList('Серія', playlist, function (idx) {
-                    playFromPlaylist(playlist, idx, movie);
+                    playFromPlaylist(playlist, idx, movie, true);
                 });
             });
         }
@@ -680,6 +736,13 @@
             param: { name: PROXY_KEY, type: 'input', placeholder: DEFAULT_PROXY, values: '', default: DEFAULT_PROXY },
             field: { name: 'CORS-проксі', description: 'Введи "-" щоб вимкнути проксі (звертатись напряму)' },
             onChange: function (value) { Lampa.Storage.set(PROXY_KEY, value); }
+        });
+
+        Lampa.SettingsApi.addParam({
+            component: 'uaflix',
+            param: { name: UA_PROXY_KEY, type: 'input', placeholder: DEFAULT_UA_PROXY, values: '', default: DEFAULT_UA_PROXY },
+            field: { name: 'UA-проксі (для серіалів, що виходять)', description: 'Повільніший фолбек через український IP. "-" щоб вимкнути' },
+            onChange: function (value) { Lampa.Storage.set(UA_PROXY_KEY, value); }
         });
 
         Lampa.SettingsApi.addParam({
