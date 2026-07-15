@@ -24,9 +24,31 @@ function rewriteM3u8(text, baseUrl, proxyBase) {
   }).join('\n');
 }
 
+// Serves the plugin's own source, always fetched live from GitHub (no
+// jsDelivr mirror-sync lag, no Lampa plugin-cache issues seen with
+// raw.githubusercontent.com served directly) — installed in Lampa once
+// and never needs its URL changed again on future updates.
+const PLUGIN_SOURCE_URL = 'https://raw.githubusercontent.com/Igor-Shpetnyi/LampaPlugin/main/uaflix.js';
+
+async function servePlugin() {
+  const resp = await fetch(PLUGIN_SOURCE_URL, { cf: { cacheTtl: 0, cacheEverything: false } });
+  const body = await resp.text();
+  return new Response(body, {
+    status: resp.status,
+    headers: {
+      'Access-Control-Allow-Origin': '*',
+      'Content-Type': 'application/javascript; charset=utf-8',
+      'Cache-Control': 'no-store'
+    }
+  });
+}
+
 export default {
   async fetch(request) {
-    const target = new URL(request.url).searchParams.get('url');
+    const url = new URL(request.url);
+    if (url.pathname === '/uaflix.js') return servePlugin();
+
+    const target = url.searchParams.get('url');
     if (!target) return new Response('missing url param', { status: 400 });
 
     let targetUrl;
